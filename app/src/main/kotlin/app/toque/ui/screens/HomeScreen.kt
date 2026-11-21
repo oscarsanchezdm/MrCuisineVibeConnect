@@ -4,6 +4,7 @@ import android.view.Gravity
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
+import app.toque.TimeSync
 import app.toque.core.i18n.I18n
 import app.toque.core.i18n.tr
 import app.toque.ui.Icon
@@ -135,6 +136,11 @@ class HomeScreen(a: MainActivity) : Screen(a) {
     }
 
     private fun refreshClock() {
+        // Heure et date masquées tant qu'elles ne sont pas réglées (voir TimeSync.showClock) ; la
+        // place reste réservée pour que l'accueil ne saute pas quand elles apparaissent.
+        val show = TimeSync.showClock(a)
+        clock.visibility = if (show) View.VISIBLE else View.INVISIBLE
+        date.visibility = if (show) View.VISIBLE else View.INVISIBLE
         clock.text = MainActivity.now()
         date.text = SimpleDateFormat(tr("EEEE d MMMM"), I18n.locale).format(Date()).replaceFirstChar { it.uppercaseChar() }
         val h = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)

@@ -11,6 +11,7 @@ import android.view.View
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import app.toque.Prefs
+import app.toque.TimeSync
 import app.toque.core.i18n.tr
 import app.toque.core.machine.JobState
 import app.toque.core.machine.LinkState
@@ -50,8 +51,11 @@ class TopBar(private val a: MainActivity) : LinearLayout(a) {
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
-            clock.text = MainActivity.now()
-            handler.postDelayed(this, 10_000)
+            // Rien tant que l'heure n'est pas réglée ou que le Wi-Fi est coupé ; la zone de l'heure
+            // reste touchable (accès caché aux réglages Android).
+            val show = TimeSync.showClock(a)
+            clock.text = if (show) MainActivity.now() else ""
+            handler.postDelayed(this, if (show) 10_000 else 2_000)
         }
     }
     private var adminTaps = 0
@@ -70,6 +74,9 @@ class TopBar(private val a: MainActivity) : LinearLayout(a) {
         addView(lid, Ui.lp(Ui.WRAP, Ui.WRAP, r = 10))
         addView(temp, Ui.lp(Ui.WRAP, Ui.WRAP, r = 10))
         addView(link, Ui.lp(Ui.WRAP, Ui.WRAP, r = 16))
+        clock.minWidth = Ui.u(64)
+        clock.minHeight = Ui.u(44)
+        clock.gravity = Gravity.CENTER
         addView(clock, Ui.lp(Ui.WRAP, Ui.WRAP, r = 6))
         home.setPadding(Ui.u(10), Ui.u(10), Ui.u(10), Ui.u(10))
         home.background = Ui.pressable(Ui.round(0, 30f), 30f)

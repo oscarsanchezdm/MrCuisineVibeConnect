@@ -115,6 +115,16 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
             a.applyLanguage()
         }, Ui.lp(Ui.MATCH, Ui.u(58), t = 4))
 
+        // ---- Couleur d'accent (mémorisée ; l'interface est reconstruite avec la nouvelle couleur)
+        val colors = section(right, tr("Couleur"), Icon.Kind.STAR)
+        colors.addView(Ui.text(c, tr("Couleur des boutons, des icônes et des repères. Le fond ne change pas."), 15f, Ui.TEXT3)
+            .apply { setLineSpacing(0f, 1.1f) })
+        for (rowIndex in 0 until 2) {
+            val row = Ui.horizontal(c, Gravity.CENTER)
+            for (i in rowIndex * 5 until rowIndex * 5 + 5) row.addView(swatch(Ui.ACCENTS[i]), LinearLayout.LayoutParams(0, Ui.u(60), 1f))
+            colors.addView(row, Ui.lp(t = if (rowIndex == 0) 12 else 6))
+        }
+
         // ---- Écran
         val screen = section(right, tr("Écran"), Icon.Kind.CLOCK)
         val delays = listOf("0" to tr("Jamais")) + listOf(2, 5, 10, 15, 30).map { it.toString() to tr("Après %d min", it) }
@@ -194,6 +204,20 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
         return card
     }
 
+    /** Pastille de couleur : un disque, entouré et coché quand c'est la couleur en cours. */
+    private fun swatch(color: Int): View {
+        val box = android.widget.FrameLayout(c)
+        val selected = color == Ui.ACCENT
+        val dot = android.widget.FrameLayout(c).apply {
+            background = Ui.pressable(Ui.round(color, 26f, if (selected) Ui.TEXT else 0, if (selected) 3f else 0f), 26f)
+            if (selected) addView(Icon(c, Icon.Kind.CHECK, Ui.ON_ACCENT), Ui.flp(Ui.u(24), Ui.u(24), Gravity.CENTER))
+            isClickable = true
+            setOnClickListener { if (!selected) a.applyAccent(color) }
+        }
+        box.addView(dot, Ui.flp(Ui.u(52), Ui.u(52), Gravity.CENTER))
+        return box
+    }
+
     private fun field(value: String, hint: String) = EditText(c).apply {
         setText(value)
         this.hint = hint
@@ -209,15 +233,25 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
         val row = Ui.horizontal(c)
         row.addView(Ui.text(c, label, 18f, Ui.TEXT), LinearLayout.LayoutParams(0, Ui.WRAP, 1f))
         var state = initial
-        val sw = Ui.text(c, "", 16f, Ui.TEXT, Ui.MEDIUM).apply { gravity = Gravity.CENTER }
+        // Interrupteur : piste arrondie, pastille à gauche (non) ou à droite (oui).
+        val sw = android.widget.FrameLayout(c)
+        val knob = View(c)
+        sw.addView(knob, Ui.flp(Ui.u(34), Ui.u(34), Gravity.CENTER_VERTICAL))
+        sw.setPadding(Ui.u(5), 0, Ui.u(5), 0)
         fun paint() {
-            sw.text = if (state) tr("Oui") else tr("Non")
-            sw.setTextColor(if (state) 0xFF1A0E05.toInt() else Ui.TEXT2)
-            sw.background = if (state) Ui.round(Ui.ACCENT, 24f) else Ui.round(Ui.SURFACE3, 24f)
+            sw.background = Ui.round(if (state) Ui.ACCENT else Ui.SURFACE3, 22f, if (state) Ui.ACCENT else Ui.STROKE, 1f)
+            knob.background = Ui.round(if (state) Ui.ON_ACCENT else Ui.TEXT2, 17f)
+            (knob.layoutParams as android.widget.FrameLayout.LayoutParams).gravity =
+                Gravity.CENTER_VERTICAL or (if (state) Gravity.END else Gravity.START)
+            knob.requestLayout()
+            sw.contentDescription = if (state) tr("Oui") else tr("Non")
         }
         paint()
-        sw.setOnClickListener { state = !state; paint(); onChange(state) }
-        row.addView(sw, LinearLayout.LayoutParams(Ui.u(84), Ui.u(46)))
+        val flip = { _: View -> state = !state; paint(); onChange(state) }
+        sw.setOnClickListener(flip)
+        row.setOnClickListener(flip)   // toute la ligne est touchable, pas seulement l'interrupteur
+        row.minimumHeight = Ui.u(52)
+        row.addView(sw, LinearLayout.LayoutParams(Ui.u(76), Ui.u(44)).apply { leftMargin = Ui.u(14) })
         return row
     }
 
