@@ -46,6 +46,13 @@ class Prefs(context: Context) {
             p.edit().putInt("accentColor", v).commit()
         }
 
+    /** Thème clair (fond clair) ; faux = bleu nuit d'origine. */
+    var lightTheme: Boolean
+        get() = p.getBoolean("lightTheme", false)
+        set(v) {
+            p.edit().putBoolean("lightTheme", v).commit()
+        }
+
     var twinHost: String
         get() = p.getString("twinHost", "127.0.0.1") ?: "127.0.0.1"
         set(v) {

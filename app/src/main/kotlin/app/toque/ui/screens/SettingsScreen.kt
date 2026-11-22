@@ -115,14 +115,22 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
             a.applyLanguage()
         }, Ui.lp(Ui.MATCH, Ui.u(58), t = 4))
 
-        // ---- Couleur d'accent (mémorisée ; l'interface est reconstruite avec la nouvelle couleur)
-        val colors = section(right, tr("Couleur"), Icon.Kind.STAR)
-        colors.addView(Ui.text(c, tr("Couleur des boutons, des icônes et des repères. Le fond ne change pas."), 15f, Ui.TEXT3)
-            .apply { setLineSpacing(0f, 1.1f) })
+        // ---- Apparence : thème sombre/clair + couleur d'accent
+        val look = section(right, tr("Apparence"), Icon.Kind.STAR)
+        look.addView(Ui.text(c, tr("Thème"), 18f, Ui.TEXT))
+        val themes = listOf("dark" to tr("Mode sombre"), "light" to tr("Mode clair"))
+        look.addView(dropdown(themes, if (a.prefs.lightTheme) "light" else "dark") { code ->
+            val light = code == "light"
+            if (light != a.prefs.lightTheme) a.applyTheme(light)
+        }, Ui.lp(Ui.MATCH, Ui.u(58), t = 8))
+        look.addView(Ui.text(c, tr("Couleur des boutons, des icônes et des repères."), 15f, Ui.TEXT3)
+            .apply { setLineSpacing(0f, 1.1f) }, Ui.lp(t = 12))
         for (rowIndex in 0 until 2) {
             val row = Ui.horizontal(c, Gravity.CENTER)
-            for (i in rowIndex * 5 until rowIndex * 5 + 5) row.addView(swatch(Ui.ACCENTS[i]), LinearLayout.LayoutParams(0, Ui.u(60), 1f))
-            colors.addView(row, Ui.lp(t = if (rowIndex == 0) 12 else 6))
+            for (i in rowIndex * 5 until rowIndex * 5 + 5) {
+                row.addView(swatch(Ui.ACCENTS[i]), LinearLayout.LayoutParams(0, Ui.u(60), 1f))
+            }
+            look.addView(row, Ui.lp(t = if (rowIndex == 0) 12 else 6))
         }
 
         // ---- Écran

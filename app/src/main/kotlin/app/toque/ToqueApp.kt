@@ -28,6 +28,7 @@ class ToqueApp : Application() {
         log = Logbook(this)
         LanguageFiles.install(this, log)
         I18n.select(I18n.resolve(prefs.language, Locale.getDefault().language).code)
+        app.toque.ui.Ui.setTheme(prefs.lightTheme)
         app.toque.ui.Ui.setAccent(prefs.accentColor)
         // Racines récentes absentes d'Android 6 (voir ExtraRoots), pour toutes les connexions HTTPS.
         try {
