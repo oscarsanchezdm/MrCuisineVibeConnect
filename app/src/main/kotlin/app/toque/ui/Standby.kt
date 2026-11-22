@@ -11,14 +11,15 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import app.toque.TimeSync
 import app.toque.core.i18n.tr
+import app.toque.core.machine.RootShell
 import app.toque.core.machine.Snapshot
 import kotlin.random.Random
 
 /**
- * Mise en veille, comme l'appli d'origine : après quelques minutes sans geste et sans programme
- * en cours, l'écran passe au noir avec l'heure, rétroéclairage au minimum. Le premier geste
- * (écran ou bouton rotatif) réveille sans rien déclencher ; le couvercle, la balance et les
- * évènements de la base réveillent aussi.
+ * Mise en veille : après quelques minutes sans geste et sans programme en cours, l'écran
+ * s'éteint. Avec [Prefs.standbyShowClock], l'heure reste affichée (rétroéclairage minimal) ;
+ * sinon le panneau est coupé via le backlight système (`lcd-backlight`, root). L'alerte bol
+ * chaud rallume le panneau le temps qu'elle soit visible. Le premier geste réveille.
  */
 class Standby(private val a: MainActivity, private val root: FrameLayout) {
     private val main = Handler(Looper.getMainLooper())
@@ -31,6 +32,8 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
     private var hot: TextView? = null
     private var running = false
     private var wokeMs = 0L
+    /** Veille sans horloge : panneau coupé via sysfs. */
+    private var panelOff = false
 
     val asleep: Boolean get() = view != null
 
@@ -48,6 +51,8 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         override fun run() {
             refresh()
             move()
+            // Android peut réécrire le backlight : on le maintient à 0 si le panneau doit rester off.
+            if (panelOff && hot?.visibility != View.VISIBLE) PanelBacklight.set(0)
             main.postDelayed(this, 60_000)
         }
     }
@@ -107,22 +112,34 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         val v = FrameLayout(a)
         v.setBackgroundColor(0xFF000000.toInt())
         v.isClickable = true
+        val showClock = a.prefs.standbyShowClock
         val b = Ui.vertical(a, Gravity.CENTER_HORIZONTAL)
         val t = Ui.text(a, "", 150f, 0xFF7C828B.toInt(), Ui.THIN)
-        b.addView(t, Ui.lp(Ui.WRAP, Ui.WRAP))
+        if (showClock) b.addView(t, Ui.lp(Ui.WRAP, Ui.WRAP))
         val h = Ui.text(a, "", 22f, Ui.WARN, Ui.MEDIUM)
-        b.addView(h, Ui.lp(Ui.WRAP, Ui.WRAP, t = 6))
-        b.addView(Ui.text(a, tr("Touchez l'écran pour reprendre"), 17f, 0xFF3E434A.toInt()), Ui.lp(Ui.WRAP, Ui.WRAP, t = 18))
+        b.addView(h, Ui.lp(Ui.WRAP, Ui.WRAP, t = if (showClock) 6 else 0))
+        if (showClock) {
+            b.addView(Ui.text(a, tr("Touchez l'écran pour reprendre"), 17f, 0xFF3E434A.toInt()), Ui.lp(Ui.WRAP, Ui.WRAP, t = 18))
+        }
         v.addView(b, Ui.flp(Ui.WRAP, Ui.WRAP, Gravity.CENTER))
         root.addView(v, Ui.flp())
         view = v
         box = b
-        clock = t
+        clock = if (showClock) t else null
         hot = h
         refresh()
         v.alpha = 0f
         v.animate().alpha(1f).setDuration(800).start()
-        brightness(0.02f)
+        if (showClock) {
+            panelOff = false
+            brightness(0.02f)
+        } else {
+            // Coupe le panneau (pas seulement le rétroéclairage WindowManager).
+            brightness(0f)
+            panelOff = PanelBacklight.off().also { ok ->
+                if (!ok) brightness(0.01f) // repli si pas de root / nœud absent
+            }
+        }
         when (a.prefs.standbyKnob) {
             "dim" -> KnobLight.start(KnobLight.NIGHT_LEVEL)
             "off" -> KnobLight.start(0)
@@ -139,6 +156,10 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         box = null
         clock = null
         hot = null
+        if (panelOff) {
+            PanelBacklight.restore()
+            panelOff = false
+        }
         brightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
         KnobLight.stop()
         if (running) onWake?.invoke()
@@ -147,9 +168,15 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
     private fun refresh() {
         clock?.text = if (TimeSync.showClock(a)) MainActivity.now() else ""
         val temp = a.snapshot.actualTempC
+        val hotNow = temp >= 50
         hot?.let {
-            it.text = if (temp >= 50) tr("Bol chaud : %d °C", temp) else ""
-            it.visibility = if (temp >= 50) View.VISIBLE else View.GONE
+            it.text = if (hotNow) tr("Bol chaud : %d °C", temp) else ""
+            it.visibility = if (hotNow) View.VISIBLE else View.GONE
+        }
+        // Sans horloge : rallume le panneau seulement pour l'alerte bol chaud.
+        if (panelOff) {
+            if (hotNow) PanelBacklight.set(PanelBacklight.ALERT_LEVEL)
+            else PanelBacklight.set(0)
         }
     }
 
@@ -167,5 +194,36 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         val lp = a.window.attributes
         lp.screenBrightness = value
         a.window.attributes = lp
+    }
+
+    /**
+     * Rétroéclairage LCD du SKMC 1200 (`/sys/class/leds/lcd-backlight/brightness`, 0–255).
+     * Écriture en root (Magisk) : le nœud est `system:system`.
+     */
+    private object PanelBacklight {
+        private const val PATH = "/sys/class/leds/lcd-backlight/brightness"
+        const val ALERT_LEVEL = 24
+        private var saved = -1
+
+        fun off(): Boolean {
+            if (!RootShell.available()) return false
+            val cur = RootShell.run("cat $PATH", 3_000)
+            if (!cur.ok) return false
+            val n = cur.out.trim().toIntOrNull() ?: return false
+            if (saved < 0) saved = n.coerceIn(1, 255)
+            return set(0)
+        }
+
+        fun restore() {
+            val v = if (saved > 0) saved else 10
+            saved = -1
+            set(v)
+        }
+
+        fun set(level: Int): Boolean {
+            if (!RootShell.available()) return false
+            val v = level.coerceIn(0, 255)
+            return RootShell.run("echo $v > $PATH", 3_000).ok
+        }
     }
 }
