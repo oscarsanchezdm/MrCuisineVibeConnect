@@ -13,6 +13,7 @@ import app.toque.TimeSync
 import app.toque.core.i18n.tr
 import app.toque.core.machine.RootShell
 import app.toque.core.machine.Snapshot
+import java.util.concurrent.Executors
 import kotlin.random.Random
 
 /**
@@ -34,6 +35,8 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
     private var wokeMs = 0L
     /** Veille sans horloge : panneau coupé via sysfs. */
     private var panelOff = false
+    /** Numéro de la veille en cours, pour ignorer une réponse root arrivée après le réveil. */
+    private var sleepId = 0
 
     val asleep: Boolean get() = view != null
 
@@ -51,8 +54,8 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         override fun run() {
             refresh()
             move()
-            // Android peut réécrire le backlight : on le maintient à 0 si le panneau doit rester off.
-            if (panelOff && hot?.visibility != View.VISIBLE) PanelBacklight.set(0)
+            // Android peut réécrire le backlight : on réécrit le niveau voulu chaque minute.
+            if (panelOff) PanelBacklight.set(panelLevel(), force = true)
             main.postDelayed(this, 60_000)
         }
     }
@@ -127,19 +130,25 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         box = b
         clock = if (showClock) t else null
         hot = h
-        refresh()
         v.alpha = 0f
         v.animate().alpha(1f).setDuration(800).start()
+        val id = ++sleepId
         if (showClock) {
             panelOff = false
             brightness(0.02f)
         } else {
-            // Coupe le panneau (pas seulement le rétroéclairage WindowManager).
+            // Coupe le panneau (pas seulement le rétroéclairage WindowManager). Les commandes root
+            // tournent hors du thread principal ; sans root ou sans nœud, repli sur l'assombrissement.
             brightness(0f)
-            panelOff = PanelBacklight.off().also { ok ->
-                if (!ok) brightness(0.01f) // repli si pas de root / nœud absent
+            panelOff = true
+            PanelBacklight.off { ok ->
+                if (!ok && id == sleepId && asleep && panelOff) {
+                    panelOff = false
+                    brightness(0.01f)
+                }
             }
         }
+        refresh()
         when (a.prefs.standbyKnob) {
             "dim" -> KnobLight.start(KnobLight.NIGHT_LEVEL)
             "off" -> KnobLight.start(0)
@@ -173,12 +182,11 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
             it.text = if (hotNow) tr("Bol chaud : %d °C", temp) else ""
             it.visibility = if (hotNow) View.VISIBLE else View.GONE
         }
-        // Sans horloge : rallume le panneau seulement pour l'alerte bol chaud.
-        if (panelOff) {
-            if (hotNow) PanelBacklight.set(PanelBacklight.ALERT_LEVEL)
-            else PanelBacklight.set(0)
-        }
+        // Sans horloge : rallume le panneau seulement pour l'alerte bol chaud (écrit seulement si le niveau change).
+        if (panelOff) PanelBacklight.set(panelLevel())
     }
+
+    private fun panelLevel(): Int = if (hot?.visibility == View.VISIBLE) PanelBacklight.ALERT_LEVEL else 0
 
     /** Déplace un peu l'heure chaque minute, pour ne pas marquer l'écran. */
     private fun move() {
@@ -198,32 +206,48 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
 
     /**
      * Rétroéclairage LCD du SKMC 1200 (`/sys/class/leds/lcd-backlight/brightness`, 0–255).
-     * Écriture en root (Magisk) : le nœud est `system:system`.
+     * Écriture en root (Magisk) : le nœud est `system:system`. Chaque appel à `su` peut prendre
+     * plusieurs secondes, donc tout passe par un fil dédié, dans l'ordre, comme [KnobLight] ;
+     * le thread principal ne fait que noter le niveau voulu et n'écrit que s'il change.
      */
     private object PanelBacklight {
         private const val PATH = "/sys/class/leds/lcd-backlight/brightness"
         const val ALERT_LEVEL = 24
+        private val main = Handler(Looper.getMainLooper())
+        private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "toque-ecran").apply { isDaemon = true } }
+        /** Dernier niveau demandé (thread principal) ; -1 hors veille. */
+        private var wanted = -1
+        /** Niveau d'avant la veille (fil dédié) ; -1 si le panneau n'a pas été coupé. */
         private var saved = -1
 
-        fun off(): Boolean {
-            if (!RootShell.available()) return false
-            val cur = RootShell.run("cat $PATH", 3_000)
-            if (!cur.ok) return false
-            val n = cur.out.trim().toIntOrNull() ?: return false
-            if (saved < 0) saved = n.coerceIn(1, 255)
-            return set(0)
+        /** Note le niveau actuel puis coupe le panneau ; [done] reçoit le résultat sur le thread principal. */
+        fun off(done: (Boolean) -> Unit) {
+            wanted = 0
+            worker.execute {
+                val r = RootShell.run("cat $PATH && echo 0 > $PATH", 3_000)
+                val n = r.out.trim().lineSequence().firstOrNull()?.trim()?.toIntOrNull()
+                val ok = r.ok && n != null
+                if (ok && saved < 0) saved = n!!.coerceIn(1, 255)
+                main.post { done(ok) }
+            }
         }
 
+        /** Rend le niveau d'avant la veille ; ne fait rien si le panneau n'a jamais été coupé. */
         fun restore() {
-            val v = if (saved > 0) saved else 10
-            saved = -1
-            set(v)
+            wanted = -1
+            worker.execute {
+                val v = saved
+                saved = -1
+                if (v > 0) RootShell.run("echo $v > $PATH", 3_000)
+            }
         }
 
-        fun set(level: Int): Boolean {
-            if (!RootShell.available()) return false
+        /** [force] réécrit même si le niveau n'a pas changé (Android a pu le remettre). */
+        fun set(level: Int, force: Boolean = false) {
             val v = level.coerceIn(0, 255)
-            return RootShell.run("echo $v > $PATH", 3_000).ok
+            if (!force && v == wanted) return
+            wanted = v
+            worker.execute { if (saved > 0) RootShell.run("echo $v > $PATH", 3_000) }
         }
     }
 }
