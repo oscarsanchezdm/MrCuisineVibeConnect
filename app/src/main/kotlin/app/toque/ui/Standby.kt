@@ -13,7 +13,9 @@ import app.toque.TimeSync
 import app.toque.core.i18n.tr
 import app.toque.core.machine.RootShell
 import app.toque.core.machine.Snapshot
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 /**
@@ -21,6 +23,10 @@ import kotlin.random.Random
  * s'éteint. Avec [Prefs.standbyShowClock], l'heure reste affichée (rétroéclairage minimal) ;
  * sinon le panneau est coupé via le backlight système (`lcd-backlight`, root). L'alerte bol
  * chaud rallume le panneau le temps qu'elle soit visible. Le premier geste réveille.
+ *
+ * `off` / `set` : fil dédié (Pierre) pour ne pas bloquer l'UI. Réveil / ensureLit : hors de
+ * cette file, pour ne pas rester bloqué derrière Magisk. Un 2e cran de molette peut encore
+ * être nécessaire parfois ; ensureLit le couvre.
  */
 class Standby(private val a: MainActivity, private val root: FrameLayout) {
     private val main = Handler(Looper.getMainLooper())
@@ -37,12 +43,9 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
     private var panelOff = false
     /** Numéro de la veille en cours, pour ignorer une réponse root arrivée après le réveil. */
     private var sleepId = 0
-    /** Réveil en cours (overlay encore là le temps de rallumer le panneau). */
-    private var waking = false
 
     val asleep: Boolean get() = view != null
 
-    /** Sortie de veille (pas à l'arrêt de l'écran) : l'alerte de mise à jour regarde à ce moment-là. */
     var onWake: (() -> Unit)? = null
 
     private val check = object : Runnable {
@@ -54,11 +57,11 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
 
     private val tick = object : Runnable {
         override fun run() {
+            if (!asleep) return
             refresh()
             move()
-            // Android peut réécrire le backlight : on réécrit le niveau voulu chaque minute.
             if (panelOff) PanelBacklight.set(panelLevel(), force = true)
-            main.postDelayed(this, 60_000)
+            if (asleep) main.postDelayed(this, 60_000)
         }
     }
 
@@ -66,8 +69,6 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         if (running) return
         running = true
         lastInputMs = SystemClock.uptimeMillis()
-        // Processus tué en veille : lcd-backlight peut rester à 0 sans overlay.
-        PanelBacklight.ensureOn()
         main.postDelayed(check, 10_000)
     }
 
@@ -77,22 +78,22 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         wake()
     }
 
-    /** Un geste de la personne : repousse la veille. Vrai si ce geste a servi à réveiller (ne pas le transmettre). */
     fun onInput(): Boolean {
         lastInputMs = SystemClock.uptimeMillis()
-        if (!asleep) return false
-        wake()
-        wokeMs = SystemClock.uptimeMillis()
-        return true
+        if (asleep) {
+            wake()
+            wokeMs = SystemClock.uptimeMillis()
+            return true
+        }
+        PanelBacklight.ensureLit()
+        return false
     }
 
-    /** Bouton rotatif : un tour envoie plusieurs crans, on ignore aussi ceux qui suivent le réveil. */
     fun onKnob(): Boolean {
         if (onInput()) return true
         return SystemClock.uptimeMillis() - wokeMs < 800
     }
 
-    /** Quelque chose se passe sur le robot : on réveille et on repousse la veille. */
     fun poke() {
         lastInputMs = SystemClock.uptimeMillis()
         wake()
@@ -134,6 +135,7 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         box = b
         clock = if (showClock) t else null
         hot = h
+        refresh()
         v.alpha = 0f
         v.animate().alpha(1f).setDuration(800).start()
         val id = ++sleepId
@@ -141,19 +143,15 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
             panelOff = false
             brightness(0.02f)
         } else {
-            // Coupe le panneau via sysfs (root). Ne pas toucher WindowManager d'abord : sur le
-            // SKMC 1200 son animation de luminosité réécrit lcd-backlight (~10) juste après un
-            // echo 0 et laisse le panneau allumé. Repli WindowManager seulement si root échoue.
+            // Sysfs d'abord (pas WindowManager) : sinon Android réécrit lcd-backlight ~10.
             panelOff = true
             PanelBacklight.off { ok ->
                 if (!ok && id == sleepId && asleep && panelOff) {
                     panelOff = false
-                    PanelBacklight.releaseHold()
                     brightness(0.01f)
                 }
             }
         }
-        refresh()
         when (a.prefs.standbyKnob) {
             "dim" -> KnobLight.start(KnobLight.NIGHT_LEVEL)
             "off" -> KnobLight.start(0)
@@ -163,7 +161,6 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
 
     private fun wake() {
         val v = view ?: return
-        if (waking) return
         main.removeCallbacks(tick)
         v.animate().cancel()
         box = null
@@ -171,32 +168,15 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         hot = null
         val wasPanelOff = panelOff
         panelOff = false
+        root.removeView(v)
+        view = null
         if (wasPanelOff) {
-            // Garder l'overlay noir jusqu'au restore sysfs : sinon Android rallume le panneau
-            // (OVERRIDE_NONE) puis une écriture 0 encore en file l'éteint → flash allumé/éteint.
-            waking = true
-            var finished = false
-            fun finish() {
-                if (finished) return
-                finished = true
-                waking = false
-                if (view !== v) return
-                root.removeView(v)
-                view = null
-                brightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
-                KnobLight.stop()
-                if (running) onWake?.invoke()
-            }
-            PanelBacklight.restore { finish() }
-            // Si Magisk/su ne répond pas : ne pas laisser l'écran noir pour toujours.
-            main.postDelayed({ finish() }, 6_000)
+            PanelBacklight.restorePanelThenKnobAndWait()
         } else {
-            root.removeView(v)
-            view = null
-            brightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
             KnobLight.stop()
-            if (running) onWake?.invoke()
+            brightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
         }
+        if (running) onWake?.invoke()
     }
 
     private fun refresh() {
@@ -207,13 +187,15 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
             it.text = if (hotNow) tr("Bol chaud : %d °C", temp) else ""
             it.visibility = if (hotNow) View.VISIBLE else View.GONE
         }
-        // Sans horloge : rallume le panneau seulement pour l'alerte bol chaud (écrit seulement si le niveau change).
-        if (panelOff) PanelBacklight.set(panelLevel())
+        // Alerte bol chaud seulement — pas d'echo 0 à chaque snapshot.
+        if (panelOff) {
+            val level = panelLevel()
+            if (level > 0) PanelBacklight.set(level)
+        }
     }
 
     private fun panelLevel(): Int = if (hot?.visibility == View.VISIBLE) PanelBacklight.ALERT_LEVEL else 0
 
-    /** Déplace un peu l'heure chaque minute, pour ne pas marquer l'écran. */
     private fun move() {
         val v = view ?: return
         val b = box ?: return
@@ -230,32 +212,22 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
     }
 
     /**
-     * Rétroéclairage LCD du SKMC 1200 (`/sys/class/leds/lcd-backlight/brightness`, 0–255).
-     * Écriture en root (Magisk) : le nœud est `system:system`. Chaque appel à `su` peut prendre
-     * plusieurs secondes, donc tout passe par un fil dédié, dans l'ordre, comme [KnobLight] ;
-     * le thread principal ne fait que noter le niveau voulu et n'écrit que s'il change.
+     * Rétroéclairage LCD. `off` / `set` sur fil dédié (Pierre). Réveil hors file.
      */
     private object PanelBacklight {
         private const val PATH = "/sys/class/leds/lcd-backlight/brightness"
         const val ALERT_LEVEL = 24
         private val main = Handler(Looper.getMainLooper())
         private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "toque-ecran").apply { isDaemon = true } }
-        /** Dernier niveau demandé (thread principal) ; -1 hors veille. */
-        @Volatile private var wanted = -1
-        /** Niveau d'avant la veille (fil dédié) ; -1 si le panneau n'a pas été coupé. */
+        private var wanted = -1
         private var saved = -1
-        /**
-         * False dès le réveil : les `echo 0` encore en file ne s'exécutent plus.
-         * Évite aussi d'empiler des `su` Magisk (qui bloquent le pont série ttyMT0).
-         */
-        @Volatile private var holdingOff = false
+        @Volatile private var epoch = 0
 
-        /** Note le niveau actuel puis coupe le panneau ; [done] reçoit le résultat sur le thread principal. */
         fun off(done: (Boolean) -> Unit) {
             wanted = 0
-            holdingOff = true
+            val my = epoch
             worker.execute {
-                if (!holdingOff) {
+                if (epoch != my) {
                     main.post { done(false) }
                     return@execute
                 }
@@ -263,47 +235,54 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
                 val n = r.out.trim().lineSequence().firstOrNull()?.trim()?.toIntOrNull()
                 val ok = r.ok && n != null
                 if (ok && saved < 0) saved = n!!.coerceIn(1, 255)
-                main.post { done(ok && holdingOff) }
+                if (epoch != my) {
+                    RootShell.run("echo 255 > $PATH", 5_000)
+                    main.post { done(false) }
+                    return@execute
+                }
+                main.post { done(ok) }
             }
         }
 
-        /** Rallume le panneau (un seul `su`) puis [done] sur le thread principal. */
-        fun restore(done: (() -> Unit)? = null) {
-            holdingOff = false
+        fun restorePanelThenKnobAndWait() {
             wanted = -1
-            worker.execute {
-                val v = saved.let { if (it > 0) it else 255 }
-                saved = -1
-                RootShell.run("echo $v > $PATH", 5_000)
-                main.post { done?.invoke() }
-            }
-        }
-
-        /** Au démarrage : si le panneau est resté à 0 (kill en veille), un seul `su` le rallume. */
-        fun ensureOn() {
-            holdingOff = false
-            wanted = -1
+            val level = if (saved > 0) saved else 255
             saved = -1
-            worker.execute {
-                RootShell.run("c=\$(cat $PATH); [ \"\$c\" = 0 ] && echo 255 > $PATH", 5_000)
+            val knob = KnobLight.isDimmed
+            if (knob) KnobLight.markRestored()
+            epoch++
+            val done = CountDownLatch(1)
+            Thread({
+                try {
+                    RootShell.run("echo $level > $PATH", 5_000)
+                    if (knob) RootShell.run(KnobLight.restoreShell + "\ntrue", 8_000)
+                    RootShell.run("echo $level > $PATH", 5_000)
+                } finally {
+                    done.countDown()
+                }
+            }, "toque-wake-panel").apply { isDaemon = true }.start()
+            try {
+                done.await(15, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
             }
         }
 
-        fun releaseHold() {
-            holdingOff = false
-            wanted = -1
+        fun ensureLit() {
+            Thread({
+                RootShell.run("c=\$(cat $PATH); [ \"\$c\" = 0 ] && echo 255 > $PATH", 5_000)
+            }, "toque-ensure-lit").apply { isDaemon = true }.start()
         }
 
-        /** [force] réécrit même si le niveau n'a pas changé (Android a pu le remettre). */
         fun set(level: Int, force: Boolean = false) {
             val v = level.coerceIn(0, 255)
-            if (!holdingOff) return
             if (!force && v == wanted) return
             wanted = v
+            val my = epoch
             worker.execute {
-                if (!holdingOff || saved <= 0) return@execute
-                if (wanted != v) return@execute
+                if (epoch != my || saved <= 0) return@execute
                 RootShell.run("echo $v > $PATH", 5_000)
+                if (epoch != my && v == 0) RootShell.run("echo 255 > $PATH", 5_000)
             }
         }
     }
