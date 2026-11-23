@@ -137,9 +137,9 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
             panelOff = false
             brightness(0.02f)
         } else {
-            // Coupe le panneau (pas seulement le rétroéclairage WindowManager). Les commandes root
-            // tournent hors du thread principal ; sans root ou sans nœud, repli sur l'assombrissement.
-            brightness(0f)
+            // Coupe le panneau via sysfs (root). Ne pas toucher WindowManager d'abord : sur le
+            // SKMC 1200 son animation de luminosité réécrit lcd-backlight (~10) juste après un
+            // echo 0 et laisse le panneau allumé. Repli WindowManager seulement si root échoue.
             panelOff = true
             PanelBacklight.off { ok ->
                 if (!ok && id == sleepId && asleep && panelOff) {
@@ -224,7 +224,7 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
         fun off(done: (Boolean) -> Unit) {
             wanted = 0
             worker.execute {
-                val r = RootShell.run("cat $PATH && echo 0 > $PATH", 3_000)
+                val r = RootShell.run("cat $PATH && echo 0 > $PATH", 8_000)
                 val n = r.out.trim().lineSequence().firstOrNull()?.trim()?.toIntOrNull()
                 val ok = r.ok && n != null
                 if (ok && saved < 0) saved = n!!.coerceIn(1, 255)
@@ -238,7 +238,7 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
             worker.execute {
                 val v = saved
                 saved = -1
-                if (v > 0) RootShell.run("echo $v > $PATH", 3_000)
+                if (v > 0) RootShell.run("echo $v > $PATH", 8_000)
             }
         }
 
@@ -247,7 +247,7 @@ class Standby(private val a: MainActivity, private val root: FrameLayout) {
             val v = level.coerceIn(0, 255)
             if (!force && v == wanted) return
             wanted = v
-            worker.execute { if (saved > 0) RootShell.run("echo $v > $PATH", 3_000) }
+            worker.execute { if (saved > 0) RootShell.run("echo $v > $PATH", 8_000) }
         }
     }
 }
